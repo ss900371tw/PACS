@@ -1,0 +1,23 @@
+version: '3'
+services:
+  orthanc:
+    image: jodogne/orthanc-plugins:latest
+    ports:
+      - "8042:8042"
+    volumes:
+      - ./PACS.jpg:/etc/orthanc/custom-logo.jpg
+      # 新增這行：將本地的 Lua 腳本掛載進容器
+      - ./pacs-trigger.lua:/etc/orthanc/pacs-trigger.lua
+      - ./orthanc.json:/etc/orthanc/orthanc.json
+    environment:
+      ORTHANC_JSON: |
+        {
+          "OrthancExplorer2" : {
+            "Enable": true,
+            "CustomMainLogo": "/etc/orthanc/custom-logo.jpg",
+            "CustomNavbarLogo": "/etc/orthanc/custom-logo.jpg"
+          },
+          "RegisteredScripts" : [
+            "/etc/orthanc/pacs-trigger.lua"
+          ]
+        }

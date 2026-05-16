@@ -1,0 +1,20 @@
+
+{
+  "Plugins" : [ 
+    "/usr/share/orthanc/plugins", 
+    "/usr/local/share/orthanc/plugins" 
+  ],
+  "OrthancExplorer2" : {
+    "Enable": true,
+    "CustomMainLogo": "/etc/orthanc/custom-logo.jpg",
+    "CustomNavbarLogo": "/etc/orthanc/custom-logo.jpg"
+  },
+  "LuaScripts" : [
+    "/etc/orthanc/pacs-trigger.lua"
+  ],
+  "RemoteAccessAllowed" : true,
+  "AuthenticationEnabled" : true,
+  "RegisteredUsers" : {
+    "orthanc" : "orthanc"
+  }
+}
