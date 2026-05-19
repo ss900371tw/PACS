@@ -1,150 +1,127 @@
 import threading
 import time
-import tkinter as tk
+import re
+import requests
 from flask import Flask, jsonify, request
-import requests  # 記得確保有安裝 requests 模組
 
 app = Flask(__name__)
 
-root = tk.Tk()
-root.withdraw()
-
 # ====== Orthanc 設定 ======
 ORTHANC_URL = "http://localhost:8042"
-AUTH = ("orthanc", "orthanc")  # 請確保帳密正確
+AUTH = ("orthanc", "orthanc")
 
-# ====== debounce 狀態 ======
+# ====== 防止無窮迴圈的快取機制 ======
+# 快取格式: { "SOPInstanceUID": 寫入時的時間戳記 }
+processed_sops = {}
+CACHE_EXPIRY_SEC = 300  # 5分鐘後過期釋放記憶體
 lock = threading.Lock()
-pending_SOPs = set()  # 用 set 儲存不重複的 SOPInstanceUID
-last_event_time = 0
-debounce_ms = 800  # 0.8 秒內合併
+
+def clean_expired_cache():
+    """定期清理過期的快取防止記憶體無限增長"""
+    while True:
+        time.sleep(60)
+        now = time.time()
+        with lock:
+            expired = [sop for sop, ts in processed_sops.items() if now - ts > CACHE_EXPIRY_SEC]
+            for sop in expired:
+                del processed_sops[sop]
+
+# 啟動背景清理執行緒
+threading.Thread(target=clean_expired_cache, daemon=True).start()
 
 
-def show_custom_popup(title, msg):
-    """自訂可以反白複製文字的彈出視窗"""
-    popup = tk.Toplevel(root)
-    popup.title(title)
-    popup.geometry("500x250")  # 稍微加寬加高以容納 preview 網址
-    popup.attributes("-topmost", True)
-
-    frame = tk.Frame(popup, padx=15, pady=15)
-    frame.pack(fill=tk.BOTH, expand=True)
-
-    bg_color = popup.cget("bg")
-    text_area = tk.Text(
-        frame,
-        wrap=tk.WORD,
-        bg=bg_color,
-        relief="flat",
-        font=("Microsoft JhengHei", 10),
-    )
-    text_area.insert(tk.END, msg)
-    text_area.config(state=tk.DISABLED)
-    text_area.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-
-    btn_ok = tk.Button(
-        frame, text="OK", width=10, command=popup.destroy, relief="groove"
-    )
-    btn_ok.pack(side=tk.BOTTOM, pady=(5, 0))
-
-    # 視窗居中
-    popup.update_idletasks()
-    width = popup.winfo_width()
-    height = popup.winfo_height()
-    x = (popup.winfo_screenwidth() // 2) - (width // 2)
-    y = (popup.winfo_screenheight() // 2) - (height // 2)
-    popup.geometry(f"{width}x{height}+{x}+{y}")
+def get_instance_uuid_by_sop(sop_instance_uid):
+    """向 Orthanc 查詢 SOPInstanceUID 對應的內部 UUID"""
+    try:
+        lookup_url = f"{ORTHANC_URL}/tools/lookup"
+        response = requests.post(lookup_url, data=sop_instance_uid, auth=AUTH, timeout=5)
+        if response.status_code == 200:
+            res_json = response.json()
+            if res_json and len(res_json) > 0:
+                return res_json[0]["ID"]
+    except Exception as e:
+        pass
+    return None
 
 
-def get_preview_url(sop_instance_uid):
-    """向 Orthanc 查詢 SOPInstanceUID 對應的預覽網址"""
-    try:
-        lookup_url = f"{ORTHANC_URL}/tools/lookup"
-        # 注意：Orthanc lookup 接收的是純文字字串作為 data
-        response = requests.post(
-            lookup_url, data=sop_instance_uid, auth=AUTH, timeout=5
-        )
+def update_instance_tag_keep_same_id(instance_id, comment_text="No pneumothorax"):
+    """
+    修改標籤並強制覆蓋原 ID
+    """
+    try:
+        # 1. 獲取原始影像的所有原生 UID 資訊
+        tags_url = f"{ORTHANC_URL}/instances/{instance_id}/tags"
+        tags_res = requests.get(tags_url, auth=AUTH, timeout=5)
+        if tags_res.status_code != 200:
+            return False
+        
+        tags_json = tags_res.json()
+        sop_instance_uid = tags_json.get("0008,0018", {}).get("Value")
+        study_uid = tags_json.get("0020,000d", {}).get("Value")
+        series_uid = tags_json.get("0020,000e", {}).get("Value")
 
-        if response.status_code == 200:
-            res_json = response.json()
-            if res_json and len(res_json) > 0:
-                instance_uuid = res_json[0]["ID"]
-                return f"{ORTHANC_URL}/instances/{instance_uuid}/preview"
-    except Exception as e:
-        print(f"查詢 Orthanc 失敗 ({sop_instance_uid}): {e}")
+        # 2. 呼叫 modify 生成帶有新標籤的 DICOM 二進位檔案
+        modify_url = f"{ORTHANC_URL}/instances/{instance_id}/modify"
+        payload = {
+            "Replace": {
+                "PatientComments": str(comment_text),
+                "SOPInstanceUID": sop_instance_uid,     
+                "StudyInstanceUID": study_uid,          
+                "SeriesInstanceUID": series_uid         
+            },
+            "Force": True
+        }
+        
+        modified_res = requests.post(modify_url, json=payload, auth=AUTH, timeout=10)
+        if modified_res.status_code != 200:
+            return False
+            
+        dicom_binary = modified_res.content
 
-    return f"無法取得該影像的預覽連結 (UID: {sop_instance_uid})"
+        # 3. 終極魔法：先刪除舊的
+        delete_url = f"{ORTHANC_URL}/instances/{instance_id}"
+        requests.delete(delete_url, auth=AUTH, timeout=5)
+        upload_url = f"{ORTHANC_URL}/instances"
+        headers = {"Content-Type": "application/dicom"}
+        upload_res = requests.post(upload_url, data=dicom_binary, auth=AUTH, headers=headers, timeout=10)
+        
+        if upload_res.status_code == 200:
+            return True
+        else:
+            return False
 
-
-def flush_popup():
-    global pending_SOPs
-
-    with lock:
-        sops_list = list(pending_SOPs)
-        pending_SOPs.clear()
-
-    count = len(sops_list)
-    if count == 0:
-        return
-
-    # 批次向 Orthanc 換取 preview_url
-    preview_urls = []
-    for sop_id in sops_list:
-        url = get_preview_url(sop_id)
-        preview_urls.append(url)
-
-    # 格式化顯示文字
-    if count == 1:
-        msg = f"You uploaded a file.\nYou can preview it from:\n{preview_urls[0]}"
-    else:
-        urls_str = "\n".join(preview_urls)
-        msg = f"You uploaded {count} unique instances.\nYou can preview them from:\n{urls_str}"
-
-    # 呼叫 Tkinter GUI 執行緒顯示彈窗
-    root.after(0, lambda: show_custom_popup("Orthanc 通知", msg))
+    except Exception as e:
+        return False
 
 
-def debounce_worker():
-    """背景檢查是否要觸發 popup"""
-    global last_event_time
+def process_webhook_task(sop_id):
+    with lock:
+        if sop_id in processed_sops:
+            return
 
-    while True:
-        time.sleep(0.2)
+    with lock:
+        processed_sops[sop_id] = time.time()
 
-        with lock:
-            if len(pending_SOPs) > 0:
-                idle_time = time.time() - last_event_time
+    instance_uuid = get_instance_uuid_by_sop(sop_id)
+    if not instance_uuid:
+        with lock:
+            if sop_id in processed_sops: del processed_sops[sop_id] # 失敗則移除快取
+        return
 
-                if idle_time > debounce_ms / 1000:
-                    root.after(0, flush_popup)
+    success = update_instance_tag_keep_same_id(instance_uuid, comment_text="No pneumothorax")
+    if not success:
+        with lock:
+            if sop_id in processed_sops: del processed_sops[sop_id]
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global last_event_time
-
-    data = request.get_json(silent=True) or {}
-    # 對應 Lua 發送的 payload 欄位名稱
-    sop_id = data.get("sopInstanceId")
-
-    if sop_id and sop_id != "UnknownSOP":
-        with lock:
-            pending_SOPs.add(sop_id)
-            last_event_time = time.time()
-
-    return jsonify({"status": "success"}), 200
-
-
-def run_flask():
-    app.run(host="0.0.0.0", port=5000)
+    data = request.get_json(silent=True) or {}
+    sop_id = data.get("sopInstanceId")
+    if sop_id and sop_id != "UnknownSOP":
+        threading.Thread(target=process_webhook_task, args=(sop_id,)).start()
+    return jsonify({"status": "received"}), 200
 
 
 if __name__ == "__main__":
-    # Flask thread
-    threading.Thread(target=run_flask, daemon=True).start()
-
-    # debounce thread
-    threading.Thread(target=debounce_worker, daemon=True).start()
-
-    root.mainloop()
-
+    app.run(host="0.0.0.0", port=5000, threaded=True)
