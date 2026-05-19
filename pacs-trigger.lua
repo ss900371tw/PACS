@@ -2,7 +2,7 @@ function OnStoredInstance(instanceId, tags, metadata)
     print('偵測到新檔案上傳，正在發送影像資訊給 Windows 端...')
     
     -- 使用你的電腦實體 IP
-    local url = 'http://192.168.2.110:5000/webhook'
+    local url = 'http://localhost:5000/webhook'
     
     -- 1. 取得 StudyInstanceUID (若無則用備用欄位)
     local studyId = tags['StudyInstanceUID'] or tags['StudyID'] or 'UnknownStudy'
