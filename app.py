@@ -3,6 +3,7 @@ import time
 import re
 import requests
 from flask import Flask, jsonify, request
+import tkinter as tk
 
 app = Flask(__name__)
 
@@ -11,10 +12,15 @@ ORTHANC_URL = "http://localhost:8042"
 AUTH = ("orthanc", "orthanc")
 
 # ====== 防止無窮迴圈的快取機制 ======
-# 快取格式: { "SOPInstanceUID": 寫入時的時間戳記 }
 processed_sops = {}
 CACHE_EXPIRY_SEC = 300  # 5分鐘後過期釋放記憶體
 lock = threading.Lock()
+
+# ====== 上傳計數器與定時器變數 ======
+uploaded_counter = 0
+counter_lock = threading.Lock()
+popup_timer = None  # 用來記錄目前的定時器物件
+
 
 def clean_expired_cache():
     """定期清理過期的快取防止記憶體無限增長"""
@@ -28,6 +34,71 @@ def clean_expired_cache():
 
 # 啟動背景清理執行緒
 threading.Thread(target=clean_expired_cache, daemon=True).start()
+
+
+def trigger_popup_with_debounce():
+    """使用防抖機制，延遲觸發 Tkinter 彈窗"""
+    global popup_timer, uploaded_counter
+    
+    with counter_lock:
+        if popup_timer is not None:
+            popup_timer.cancel()
+        
+        # 建立一個新的定時器，等 1.5 秒內都沒有新影像上傳成功，才執行 _execute_popup
+        popup_timer = threading.Timer(1.5, _execute_popup)
+        popup_timer.start()
+
+
+def _execute_popup():
+    """真正執行 Tkinter 彈窗並歸零計數器的內部函式"""
+    global uploaded_counter, popup_timer
+    
+    with counter_lock:
+        count = uploaded_counter
+        uploaded_counter = 0  # 彈窗後將計數器歸零
+        popup_timer = None    # 清空定時器狀態
+    
+    if count == 0:
+        return
+
+    # 判斷單複數：如果 count 為 1 則用 "dicom"，大於 1 則用 "dicoms"
+    unit = "dicom" if count == 1 else "dicoms"
+    message_text = f"You successfully uploaded {count} {unit}."
+
+    def _popup():
+        root = tk.Tk()
+        root.withdraw()  # 隱藏主視窗
+        
+        # 建立自訂的置頂彈窗
+        top = tk.Toplevel(root)
+        top.title("Upload Success")
+        top.attributes("-topmost", True)
+        top.geometry("350x130")
+        top.resizable(False, False)
+        
+        # 讓視窗顯示在螢幕正中央
+        top.update_idletasks()
+        x = (top.winfo_screenwidth() - top.winfo_reqwidth()) // 2
+        y = (top.winfo_screenheight() - top.winfo_reqheight()) // 2
+        top.geometry(f"+{x}+{y}")
+
+        # 使用 Text 元件讓文字可以被選取反白
+        text_area = tk.Text(top, wrap="word", font=("Arial", 11), height=2, bd=0, bg=top.cget("bg"))
+        text_area.insert("1.0", message_text)
+        text_area.configure(state="disabled")  # 設定唯讀，防篡改但允許反白複製
+        text_area.pack(pady=20, padx=20, fill="both", expand=True)
+
+        # 關閉按鈕
+        btn = tk.Button(top, text="OK", width=10, command=root.destroy)
+        btn.pack(pady=(0, 15))
+        
+        # 點擊視窗右上角 X 也能正確釋放資源
+        top.protocol("WM_DELETE_WINDOW", root.destroy)
+        
+        root.mainloop()
+    
+    # 透過獨立執行緒開啟視窗
+    threading.Thread(target=_popup).start()
 
 
 def get_instance_uuid_by_sop(sop_instance_uid):
@@ -45,9 +116,7 @@ def get_instance_uuid_by_sop(sop_instance_uid):
 
 
 def update_instance_tag_keep_same_id(instance_id, comment_text="No pneumothorax"):
-    """
-    修改標籤並強制覆蓋原 ID
-    """
+    """修改標籤並強制覆蓋原 ID"""
     try:
         # 1. 獲取原始影像的所有原生 UID 資訊
         tags_url = f"{ORTHANC_URL}/instances/{instance_id}/tags"
@@ -78,7 +147,7 @@ def update_instance_tag_keep_same_id(instance_id, comment_text="No pneumothorax"
             
         dicom_binary = modified_res.content
 
-        # 3. 終極魔法：先刪除舊的
+        # 3. 先刪除舊的，再上傳新的
         delete_url = f"{ORTHANC_URL}/instances/{instance_id}"
         requests.delete(delete_url, auth=AUTH, timeout=5)
         upload_url = f"{ORTHANC_URL}/instances"
@@ -95,6 +164,8 @@ def update_instance_tag_keep_same_id(instance_id, comment_text="No pneumothorax"
 
 
 def process_webhook_task(sop_id):
+    global uploaded_counter
+    
     with lock:
         if sop_id in processed_sops:
             return
@@ -105,11 +176,16 @@ def process_webhook_task(sop_id):
     instance_uuid = get_instance_uuid_by_sop(sop_id)
     if not instance_uuid:
         with lock:
-            if sop_id in processed_sops: del processed_sops[sop_id] # 失敗則移除快取
+            if sop_id in processed_sops: del processed_sops[sop_id]
         return
 
     success = update_instance_tag_keep_same_id(instance_uuid, comment_text="No pneumothorax")
-    if not success:
+    
+    if success:
+        with counter_lock:
+            uploaded_counter += 1
+        trigger_popup_with_debounce()
+    else:
         with lock:
             if sop_id in processed_sops: del processed_sops[sop_id]
 
