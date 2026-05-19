@@ -11,7 +11,7 @@ function OnStoredInstance(instanceId, tags, metadata)
     print('偵測到新檔案: ' .. sopInstanceId .. '，正在通知後端 AI 自動標籤服務...')
     
     -- 2. 使用你的電腦實體 IP (或 localhost 如果在同一台)
-    local url = 'http://192.168.2.110:5000/webhook'
+    local url = 'http://localhost:5000/webhook'
     
     -- 3. 打包 JSON payload
     local payload = '{"studyId": "' .. studyId .. '", "sopInstanceId": "' .. sopInstanceId .. '"}'
