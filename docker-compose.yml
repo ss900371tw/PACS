@@ -21,3 +21,4 @@ services:
             "/etc/orthanc/pacs-trigger.lua"
           ]
         }
+
