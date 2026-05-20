@@ -37,8 +37,12 @@ show tkinter
 
 
 ＃ 刪除 orthanc 
+
 Linux
+
 docker compose down
+
 Windows:
+
 docker-compose down
 
