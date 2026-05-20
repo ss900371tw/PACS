@@ -193,7 +193,7 @@ def process_webhook_task(sop_id):
             if sop_id in processed_sops: del processed_sops[sop_id]
         return
 
-    new_instance_id = update_instance_tag_keep_same_id(instance_uuid, comment_text="No pneumothorax")
+    new_instance_id = update_instance_tag_keep_same_id(instance_uuid, comment_text="This is a chest xray. You can see lungs.")
     
     if new_instance_id:
         with counter_lock:
