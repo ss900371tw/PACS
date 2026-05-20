@@ -1,5 +1,6 @@
 import threading
 import time
+import queue
 import requests
 from flask import Flask, jsonify, request
 import tkinter as tk
@@ -21,9 +22,8 @@ successful_new_instance_ids = []  # 用來儲存新產生的 Orthanc 內部新 i
 counter_lock = threading.Lock()
 popup_timer = None  # 用來記錄目前的定時器物件
 
-# ====== Tkinter 全域主視窗物件與文字元件 ======
+# ====== Tkinter 專用執行緒安全佇列與全域 root ======
 root = None
-text_area = None
 
 
 def clean_expired_cache():
@@ -54,7 +54,7 @@ def trigger_popup_with_debounce():
 
 
 def _execute_popup():
-    """準備彈窗文字，並安全地呼叫 root 更新介面"""
+    """準備彈窗文字，並安全地將彈窗任務交給 Tkinter 主執行緒"""
     global uploaded_counter, successful_new_instance_ids, popup_timer, root
     
     with counter_lock:
@@ -85,41 +85,38 @@ def _execute_popup():
         for new_id in instance_list:
             message_text += f"{ORTHANC_URL}/wsi/app/viewer.html?instance={new_id}\n"
 
-    # 安全地讓主執行緒去控制 root 彈出
+    # 【核心修正】使用 root.after 叫醒主執行緒來渲染 UI，避免多執行緒死結
     if root:
-        root.after(0, lambda: show_root_window(message_text, count, len(instance_list)))
+        root.after(0, lambda: create_toplevel_window(message_text, count, len(instance_list)))
 
 
-def show_root_window(message_text, count, list_条数):
-    """將隱藏的 root 視窗更新文字、調整大小並移到螢幕中央顯示"""
-    global root, text_area
-    
-    # 1. 更新文字內容
-    text_area.configure(state="normal")
-    text_area.delete("1.0", tk.END)
-    text_area.insert("1.0", message_text)
-    text_area.configure(state="disabled")
-    
-    # 2. 根據文字多寡動態調整視窗高度
-    window_height = 140 + (max(0, list_条数 - 1) * 20) if count > 1 else 130
-    
-    # 3. 計算螢幕中央座標
-    root.update_idletasks()
-    x = (root.winfo_screenwidth() - 580) // 2
-    y = (root.winfo_screenheight() - window_height) // 2
-    
-    # 4. 重新設定大小並移回螢幕中央 (取消一開始的隱形狀態)
-    root.geometry(f"580x{window_height}+{x}+{y}")
-    root.deiconify()  # 確保視窗不是最小化狀態
-    root.attributes("-topmost", True)  # 強制置頂
-    root.focus_force()  # 強制取得焦點
-
-
-def hide_root_window():
-    """使用者點擊 OK 或關閉視窗時，只把 root 移到螢幕外隱藏，而不摧毀它"""
+def create_toplevel_window(message_text, count, list_條數):
+    """真正由主執行緒渲染的視窗函式"""
     global root
-    # 把視窗縮小並丟到外太空（螢幕外），保留 mainloop 活體
-    root.geometry("0x0+9999+9999")
+    
+    top = tk.Toplevel(root)
+    top.title("Upload Success")
+    top.attributes("-topmost", True)
+    
+    # 根據文字多寡動態調整視窗高度
+    window_height = 140 + (max(0, list_條數 - 1) * 20) if count > 1 else 130
+    top.geometry(f"580x{window_height}")  
+    top.resizable(True, True)  
+    
+    top.update_idletasks()
+    x = (top.winfo_screenwidth() - top.winfo_reqwidth()) // 2
+    y = (top.winfo_screenheight() - top.winfo_reqheight()) // 2
+    top.geometry(f"+{x}+{y}")
+
+    # 使用 Text 元件方便複製網址
+    text_area = tk.Text(top, wrap="word", font=("Arial", 10), bd=0, bg=top.cget("bg"))
+    text_area.insert("1.0", message_text)
+    text_area.configure(state="disabled")  
+    text_area.pack(pady=15, padx=20, fill="both", expand=True)
+
+    # 點擊 OK 只銷毀 Toplevel 視窗，不要摧毀 root 主核心
+    btn = tk.Button(top, text="OK", width=10, command=top.destroy)
+    btn.pack(pady=(0, 12))
 
 
 def get_instance_uuid_by_sop(sop_instance_uid):
@@ -227,24 +224,9 @@ if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    # 2. 主執行緒直接初始化 root 視窗與佈局
+    # 2. 主執行緒常駐給 Tkinter 核心使用
     root = tk.Tk()
-    root.title("Upload Success")
+    root.withdraw()  # 隱藏主視窗，我們只用 Toplevel 來跳通知
     
-    # 關鍵：一開始先把它藏到螢幕外 (+9999)，等 Webhook 觸發時才拉回中央
-    root.geometry("0x0+9999+9999")
-    root.resizable(True, True)
-
-    # 預先在 root 建立好 Text 元件（用來裝網址）
-    text_area = tk.Text(root, wrap="word", font=("Arial", 10), bd=0, bg=root.cget("bg"))
-    text_area.pack(pady=15, padx=20, fill="both", expand=True)
-
-    # 預先建立好 OK 按鈕，點擊時呼叫 hide_root_window 移到螢幕外
-    btn = tk.Button(root, text="OK", width=10, command=hide_root_window)
-    btn.pack(pady=(0, 12))
-
-    # 攔截右上角的 "X" 關閉按鈕，讓它同樣執行隱藏，而不是摧毀主視窗
-    root.protocol("WM_DELETE_WINDOW", hide_root_window)
-
-    # 進入 Tkinter 主循環
+    # 開始進入 Tkinter 主循環，永不退出，直到手動關閉命令列
     root.mainloop()
