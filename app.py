@@ -133,7 +133,7 @@ def get_instance_uuid_by_sop(sop_instance_uid):
     return None
 
 
-def update_instance_tag_keep_same_id(instance_id, comment_text="No pneumothorax"):
+def update_instance_tag_keep_same_id(instance_id, comment_text="This is a chest xray. You can see lungs."):
     """修改標籤並強制覆蓋原 ID，成功時回傳「新生成的 Orthanc 內部 Instance ID」"""
     try:
         tags_url = f"{ORTHANC_URL}/instances/{instance_id}/tags"
