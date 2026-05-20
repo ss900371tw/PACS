@@ -1,7 +1,7 @@
 function OnStoredInstance(instanceId, tags, metadata)
     -- 【核心安全檢查】如果是 Orthanc 內部 Modify 產生來的，直接跳過，斷絕無窮迴圈
     if metadata and (metadata['ModifiedFrom'] or metadata['AnonymizedFrom']) then
-        print('[Lua 跳過] 內部修改產生的新影像，不發送 Webhook。')
+
         return
     end
 
@@ -22,7 +22,6 @@ function OnStoredInstance(instanceId, tags, metadata)
         return
     end
 
-    print('偵測到新檔案 (SOP_ID): ' .. sopInstanceId .. '，正在通知後端 AI 自動標籤服務...')
     
     -- 【終極突破】在不改 docker-compose 的情況下，直接走 Docker 預設網關連回外面的實體機
     local url = 'http://172.17.0.1:5000/webhook'
@@ -35,7 +34,7 @@ function OnStoredInstance(instanceId, tags, metadata)
         HttpPost(url, payload, headers)
     end)
 end
-    
+
 
     
 
