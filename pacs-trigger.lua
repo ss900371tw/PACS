@@ -1,33 +1,40 @@
 function OnStoredInstance(instanceId, tags, metadata)
-    -- 1. 取得 SOPInstanceUID (單張影像的唯一 ID)
-    local sopInstanceId = tags['SOPInstanceUID'] or instanceId or 'UnknownSOP'
-    local studyId = tags['StudyInstanceUID'] or tags['StudyID'] or 'UnknownStudy'
+    -- 【核心安全檢查】如果是 Orthanc 內部 Modify 產生來的，直接跳過，斷絕無窮迴圈
+    if metadata and (metadata['ModifiedFrom'] or metadata['AnonymizedFrom']) then
+        print('[Lua 跳過] 內部修改產生的新影像，不發送 Webhook。')
+        return
+    end
+
+    -- 【終極修正】強迫向 Orthanc 請求最完整、最真實的 DICOM 標籤資訊
+    local response = ParseJson(RestApiGet('/instances/' .. instanceId .. '/tags?short'))
     
-    -- 檢查是否為 Unknown，如果是就不用傳送了
+    -- DICOM 標準標籤：0008,0018 是 SOPInstanceUID
+    local sopInstanceId = response['0008,0018']
+    -- DICOM 標準標籤：0020,000d 是 StudyInstanceUID
+    local studyId = response['0020,000d'] or 'UnknownStudy'
+
+    -- 如果真的拿不到真實 SOPUID，再退求其次使用傳入的 tags
+    if not sopInstanceId then
+        sopInstanceId = tags['SOPInstanceUID'] or instanceId or 'UnknownSOP'
+    end
+
     if sopInstanceId == 'UnknownSOP' then
         return
     end
 
-    print('偵測到新檔案: ' .. sopInstanceId .. '，正在通知後端 AI 自動標籤服務...')
+    print('偵測到新檔案 (SOP_ID): ' .. sopInstanceId .. '，正在通知後端 AI 自動標籤服務...')
     
-    -- 2. 使用你的電腦實體 IP (或 localhost 如果在同一台)
-    local url = 'http://localhost:5000/webhook'
-    
-    -- 3. 打包 JSON payload
+    -- 【終極突破】在不改 docker-compose 的情況下，直接走 Docker 預設網關連回外面的實體機
+    local url = 'http://172.17.0.1:5000/webhook'
     local payload = '{"studyId": "' .. studyId .. '", "sopInstanceId": "' .. sopInstanceId .. '"}'
-    
-    -- 4. 設定 Header
     local headers = {
         ["Content-Type"] = "application/json"
     }
     
-    -- 5. 發送 POST 請求
-    -- 使用 pcall (protected call) 防止網路異常導致整個 Orthanc 崩潰
     pcall(function()
         HttpPost(url, payload, headers)
     end)
 end
-
     
 
     
