@@ -21,7 +21,7 @@ from unsloth import FastVisionModel
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 
 # 這裡直接載入你合併微調後的完整全參數模型
-model_id = "ss900371tw/medgemma-finetuned-lora"
+model_id = "ss900371tw/medgemma-vqa-lora"
 
 # Unsloth 載入多模態模型時，會同時回傳 model 與 processor (包含 tokenizer 與 image_processor)
 model, processor = FastVisionModel.from_pretrained(
@@ -43,8 +43,8 @@ processed_sops = {}
 CACHE_EXPIRY_SEC = 300  # 5分鐘後過期釋放記憶體
 lock = threading.Lock()
 
-active_processing_locks = {}
-processing_dict_lock = threading.Lock()
+# ====== 🚀 關鍵修正：引入任務隊列 (Task Queue) ======
+task_queue = queue.Queue()
 
 # ====== 上傳計數器、新 Instance ID 快取與定時器變數 ======
 uploaded_counter = 0
@@ -117,7 +117,7 @@ def _execute_popup():
 
 
 def create_toplevel_window(message_text, count, list_count):
-    """真正由主執行緒渲染的視窗函式 (💡 修正引數名稱為英文)"""
+    """真正由主執行緒渲染的視窗函式"""
     global root
     
     top = tk.Toplevel(root)
@@ -177,7 +177,6 @@ def analyze_image_with_ai(instance_id):
             ]}
         ]
 
-        # 💡【關鍵修正】：使用 Unsloth 封裝的統一 processor 同時處理影像與文字聊天模版
         input_text = processor.apply_chat_template(messages, add_generation_prompt=True)
         inputs = processor(images=image, text=input_text, return_tensors="pt").to("cuda")
 
@@ -227,6 +226,7 @@ def update_instance_tag_keep_same_id(instance_id, comment_text):
             
         dicom_binary = modified_res.content
 
+        # 在刪除與重傳前，先把舊的 SOP 記錄到快取防止無限迴圈
         if sop_instance_uid:
             with lock:
                 processed_sops[sop_instance_uid] = time.time()
@@ -247,56 +247,55 @@ def update_instance_tag_keep_same_id(instance_id, comment_text):
         return None
 
 
-def process_webhook_task(sop_id):
+# ====== 🚀 關鍵修正：獨立的 AI 消費者執行緒 ======
+def ai_worker_loop():
+    """單一執行緒：依序從隊列中取出 SOP ID 進行 AI 推論，避免 GPU 競爭"""
     global uploaded_counter, successful_new_instance_ids
+    print("🚀 AI 推論後台排隊執行緒已啟動...")
     
-    with lock:
-        if sop_id in processed_sops:
-            return
+    while True:
+        sop_id = task_queue.get()  # 如果隊列是空的，會在這裡乖乖等
+        try:
+            # 檢查是否已經被處理過 (二次防線)
+            with lock:
+                if sop_id in processed_sops:
+                    continue
 
-    with processing_dict_lock:
-        if sop_id not in active_processing_locks:
-            active_processing_locks[sop_id] = threading.Lock()
-        sop_lock = active_processing_locks[sop_id]
+            instance_uuid = get_instance_uuid_by_sop(sop_id)
+            if not instance_uuid:
+                continue
 
-    if not sop_lock.acquire(blocking=False):
-        return
+            # 呼叫 AI（現在只有這一個執行緒在呼叫，絕對不會漏圖了！）
+            diagnosis_result = analyze_image_with_ai(instance_uuid)
 
-    try:
-        with lock:
-            if sop_id in processed_sops:
-                return
-
-        instance_uuid = get_instance_uuid_by_sop(sop_id)
-        if not instance_uuid:
-            return
-
-        diagnosis_result = analyze_image_with_ai(instance_uuid)
-
-        new_instance_id = update_instance_tag_keep_same_id(instance_uuid, comment_text=diagnosis_result)
-        
-        if new_instance_id:
-            with counter_lock:
-                uploaded_counter += 1
-                successful_new_instance_ids.append(new_instance_id)  
-            trigger_popup_with_debounce()
+            new_instance_id = update_instance_tag_keep_same_id(instance_uuid, comment_text=diagnosis_result)
             
-    finally:
-        sop_lock.release()
-        with processing_dict_lock:
-            if sop_id in active_processing_locks:
-                try:
-                    del active_processing_locks[sop_id]
-                except KeyError:
-                    pass
+            if new_instance_id:
+                with counter_lock:
+                    uploaded_counter += 1
+                    successful_new_instance_ids.append(new_instance_id)  
+                trigger_popup_with_debounce()
+                
+        except Exception as e:
+            print(f"處理任務時發生非預期錯誤: {e}")
+        finally:
+            task_queue.task_done()
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
     sop_id = data.get("sopInstanceId")
+    
     if sop_id and sop_id != "UnknownSOP":
-        threading.Thread(target=process_webhook_task, args=(sop_id,)).start()
+        # 檢查快取，如果不是剛被修改標籤重傳的，就塞進排隊隊列中
+        with lock:
+            is_processed = sop_id in processed_sops
+            
+        if not is_processed:
+            print(f"📥 收到新 DICOM Webhook，加入排隊隊列: {sop_id}")
+            task_queue.put(sop_id)
+            
     return jsonify({"status": "received"}), 200
 
 
@@ -305,7 +304,18 @@ def run_flask():
 
 
 if __name__ == "__main__":
+    # 1. 啟動 Flask 接收端 (多執行緒)
     flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # 2. 🚀 啟動唯一的 AI 推論消費端 (單執行緒排隊)
+    ai_thread = threading.Thread(target=ai_worker_loop, daemon=True)
+    ai_thread.start()
+
+    # 3. 啟動 Tkinter GUI 主執行緒
+    root = tk.Tk()
+    root.withdraw()  
+    root.mainloop()
     flask_thread.start()
 
     root = tk.Tk()
