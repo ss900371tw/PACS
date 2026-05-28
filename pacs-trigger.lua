@@ -24,7 +24,7 @@ function OnStoredInstance(instanceId, tags, metadata)
 
     
     -- 【終極突破】在不改 docker-compose 的情況下，直接走 Docker 預設網關連回外面的實體機
-    local url = 'http://172.17.0.1:5000/webhook'
+    local url = 'http://host.docker.internal:5000/webhook'
     -- local url = 'http://host.docker.internal:5000/webhook'
 
     local payload = '{"studyId": "' .. studyId .. '", "sopInstanceId": "' .. sopInstanceId .. '"}'
