@@ -374,3 +374,15 @@ def run_flask():
 # =====================================================================
 # 主程式進入點 (確保 Tkinter 事件循環不休眠)
 # =====================================================================
+if __name__ == "__main__":
+    print("====== 正在初始化服務 ======")
+    
+    # 1. 啟動背景 Flask 執行緒
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print("🚀 背景 Flask Webhook 服務已啟動 (Port: 5000)")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n 服務已停止")
