@@ -374,26 +374,3 @@ def run_flask():
 # =====================================================================
 # 主程式進入點 (確保 Tkinter 事件循環不休眠)
 # =====================================================================
-if __name__ == "__main__":
-    print("====== 正在初始化服務 ======")
-    
-    # 1. 啟動背景 Flask 執行緒
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    print("🚀 背景 Flask Webhook 服務已啟動 (Port: 5000)")
-
-    # 2. 主執行緒常駐給 Tkinter 核心使用
-    root = tk.Tk()
-    root.title("MedGemma AI Listener")
-    
-    # 將其縮小並放到角落，確保 active 狀態且不干擾主要操作
-    root.geometry("250x60+0+0") 
-    
-    # 加上簡單的狀態標籤，讓介面知道它還活著
-    status_label = tk.Label(root, text="AI 服務運行中...\n請勿關閉此視窗", font=("Arial", 10))
-    status_label.pack(pady=10)
-    
-    print("🎉 Tkinter 主事件循環已就緒，等待 DICOM 上傳 Webhook...")
-    
-    # 開始進入 Tkinter 主循環
-    root.mainloop()
