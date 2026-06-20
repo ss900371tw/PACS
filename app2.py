@@ -76,10 +76,7 @@ processing_dict_lock = threading.Lock()
 uploaded_counter = 0
 successful_new_instance_ids = []  # 用來儲存新產生的 Orthanc 內部新 instance_id
 counter_lock = threading.Lock()
-popup_timer = None  # 用來記錄目前的定時器物件
 
-# ====== Tkinter 全域 root ======
-root = None
 
 
 def clean_expired_cache():
@@ -96,83 +93,6 @@ def clean_expired_cache():
 threading.Thread(target=clean_expired_cache, daemon=True).start()
 
 
-def trigger_popup_with_debounce():
-    """使用防抖機制，延遲觸發 Tkinter 彈窗"""
-    global popup_timer
-    
-    with counter_lock:
-        if popup_timer is not None:
-            popup_timer.cancel()
-        
-        # 1.5 秒內都沒有新影像上傳成功，才執行 _execute_popup
-        popup_timer = threading.Timer(1.5, _execute_popup)
-        popup_timer.start()
-
-
-def _execute_popup():
-    """準備彈窗文字，並安全地將彈窗任務交給 Tkinter 主執行緒"""
-    global uploaded_counter, successful_new_instance_ids, popup_timer, root
-    
-    with counter_lock:
-        count = uploaded_counter
-        instance_list = list(set(successful_new_instance_ids))  
-        
-        # 狀態歸零，供下一波上傳使用
-        uploaded_counter = 0
-        successful_new_instance_ids = []
-        popup_timer = None
-    
-    if count == 0:
-        return
-
-    # ====== 動態組合文字與連結 ======
-    if count == 1:
-        unit = "dicom"
-        pronoun = "it"
-        new_id = instance_list[0] if instance_list else "UNKNOWN"
-        message_text = (
-            f"You successfully uploaded 1 {unit}. "
-            f"You can open {pronoun} from {ORTHANC_URL}/wsi/app/viewer.html?instance={new_id}"
-        )
-    else:
-        unit = "dicoms"
-        pronoun = "them"
-        message_text = f"You successfully uploaded {count} {unit}. You can open {pronoun} from:\n"
-        for new_id in instance_list:
-            message_text += f"{ORTHANC_URL}/wsi/app/viewer.html?instance={new_id}\n"
-
-    # 使用 root.after 叫醒主執行緒來渲染 UI，避免多執行緒死結
-    if root:
-        root.after(0, lambda: create_toplevel_window(message_text, count, len(instance_list)))
-
-
-def create_toplevel_window(message_text, count, list_count):
-    """真正由主執行緒渲染的視窗函式"""
-    global root
-    
-    top = tk.Toplevel(root)
-    top.title("Upload Success")
-    top.attributes("-topmost", True)
-    
-    # 根據文字多寡動態調整視窗高度
-    window_height = 140 + (max(0, list_count - 1) * 20) if count > 1 else 130
-    top.geometry(f"580x{window_height}")  
-    top.resizable(True, True)  
-    
-    top.update_idletasks()
-    x = (top.winfo_screenwidth() - top.winfo_reqwidth()) // 2
-    y = (top.winfo_screenheight() - top.winfo_reqheight()) // 2
-    top.geometry(f"+{x}+{y}")
-
-    # 使用 Text 元件方便複製網址
-    text_area = tk.Text(top, wrap="word", font=("Arial", 10), bd=0, bg=top.cget("bg"))
-    text_area.insert("1.0", message_text)
-    text_area.configure(state="disabled")  
-    text_area.pack(pady=15, padx=20, fill="both", expand=True)
-
-    # 點擊 OK 只銷毀 Toplevel 視窗，不要摧毀 root 主核心
-    btn = tk.Button(top, text="OK", width=10, command=top.destroy)
-    btn.pack(pady=(0, 12))
 
 
 def get_instance_uuid_by_sop(sop_instance_uid):
@@ -469,8 +389,7 @@ def process_webhook_task(sop_id):
                 uploaded_counter += 1
                 successful_new_instance_ids.append(new_instance_id)  
             
-            print(f"🔔 [步驟 4] 觸發 Tkinter 防抖定時器 (1.5秒後彈窗)...")
-            trigger_popup_with_debounce()
+            
         else:
             print(f"❌ [失敗] 修改 Tag 或重新上傳失敗，未觸發彈窗。")
             
@@ -510,19 +429,8 @@ if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     print("🚀 背景 Flask Webhook 服務已啟動 (Port: 5000)")
-
-    # 2. 主執行緒常駐給 Tkinter 核心使用
-    root = tk.Tk()
-    root.title("MedGemma AI Listener")
-    
-    # 將其縮小並放到角落，確保 active 狀態且不干擾主要操作
-    root.geometry("250x60+0+0") 
-    
-    # 加上簡單的狀態標籤，讓介面知道它還活著
-    status_label = tk.Label(root, text="AI 服務運行中...\n請勿關閉此視窗", font=("Arial", 10))
-    status_label.pack(pady=10)
-    
-    print("🎉 Tkinter 主事件循環已就緒，等待 DICOM 上傳 Webhook...")
-    
-    # 開始進入 Tkinter 主循環
-    root.mainloop()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n 服務已停止")
