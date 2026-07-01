@@ -36,6 +36,20 @@ show tkinter
 
 
 
+
+
+
+
+
+pyinstaller --noconfirm --onedir --name "MedGemma_AI_Listener" \
+    --exclude-module PyQt5 \
+    --exclude-module PyQt6 \
+    --exclude-module PyQt5-sip \
+    --exclude-module PyQt6-sip \
+    --exclude-module sphinx \
+    --exclude-module logging \
+    app2.py
+
 ＃ 刪除 orthanc 
 
 Linux
