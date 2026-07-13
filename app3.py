@@ -18,9 +18,9 @@ from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndByte
 from peft import PeftModel  
 
 # ====== 檢查與指派裝置 ======
-device_m1 = "cuda:0" if torch.cuda.is_available() else "cpu"
+device_m1 = "cpu" if torch.cuda.is_available() else "cpu"
 # 如果只有單張卡，模型二就必須與模型一共享或依賴 BitsAndBytes 量化
-device_m2 = "cuda:0" if torch.cuda.is_available() else "cpu" 
+device_m2 = "cpu" if torch.cuda.is_available() else "cpu" 
 print(f"🎬 模型一配置裝置: {device_m1.upper()} | 模型二配置裝置: {device_m2.upper()}")
 
 HF_TOKEN = os.getenv("HF_TOKEN", "")
@@ -111,20 +111,21 @@ def get_instance_uuid_by_sop(sop_instance_uid):
 
 def analyze_image_with_dual_ai(instance_id):
     """
-    管線化串接雙模型：
-    1. 使用模型一辨識 CXR 疾病
-    2. 將疾病帶入模型二，引導 27B 模型深入分析影像特徵與形成主因
+    管線化串接多階段模型：
+    1. 使用模型一辨識 CXR 疾病 (Diagnosis)
+    2. 將疾病帶入模型二，引導 27B 模型深入分析影像特徵與形成主因 (Reasoning)
+    3. 將疾病帶入模型一 (MedGemma 4B)，獨立推論藥物治療 (Medications) 與治療建議 (Treatment)
     """
     try:
         preview_url = f"{ORTHANC_URL}/instances/{instance_id}/preview"
         response = requests.get(preview_url, auth=AUTH, timeout=10)
         if response.status_code != 200:
-            return "Analysis Failed (Preview Fetch Error)", "N/A"
+            return "Analysis Failed", "N/A", "N/A", "N/A"
 
         image = Image.open(BytesIO(response.content)).convert("RGB")
 
         # -----------------------------------------------------------------
-        # 🚀 階段一：模型一進行疾病分類 (VinDr LoRA)
+        # 🚀 階段一：模型一進行疾病分類 (VinDr LoRA) -> Diagnosis
         # -----------------------------------------------------------------
         m1_messages = [{
             "role": "user",
@@ -147,9 +148,8 @@ def analyze_image_with_dual_ai(instance_id):
         print(f" [模型一 診斷結果]: {diagnosis}")
 
         # -----------------------------------------------------------------
-        # 🚀 階段二：模型二進行臨床原因推導 (MedGemma 27B)
+        # 🚀 階段二：模型二進行臨床原因推導 (MedGemma 27B) -> Reasoning
         # -----------------------------------------------------------------
-        # 動態將模型一產生的疾病類別帶入 Prompt 中，逼問 27B 大模型其醫學影像依據
         reasoning_prompt_text = (
             f"This chest X-ray (CXR) image is diagnosed with '{diagnosis}'. "
             f"Based on the visual evidence in this image, explain why this diagnosis was made "
@@ -164,25 +164,70 @@ def analyze_image_with_dual_ai(instance_id):
             ]
         }]
         m2_prompt = processor_m2.apply_chat_template(m2_messages, tokenize=False, add_generation_prompt=True)
-        
-        # 注意：此處需將 inputs 送往模型二指定的運算裝置
         m2_inputs = processor_m2(text=[m2_prompt], images=[[image]], return_tensors="pt").to(model_m2.device)
 
         with torch.no_grad():
             m2_outputs = model_m2.generate(
                 **m2_inputs,
-                max_new_tokens=250, # 原因敘述較長，放寬 Token 限制
+                max_new_tokens=250, 
                 pad_token_id=processor_m2.tokenizer.pad_token_id or processor_m2.tokenizer.eos_token_id
             )
         m2_input_len = m2_inputs["input_ids"].shape[-1]
         reasoning = processor_m2.decode(m2_outputs[0][m2_input_len:], skip_special_tokens=True).strip()
         print(f" [模型二 推理原因]: {reasoning}")
 
-        return diagnosis, reasoning
+        # -----------------------------------------------------------------
+        # 🚀 階段三：使用 MedGemma 4B 推論藥物與治療建議 (並要求明確標記以供解析)
+        # -----------------------------------------------------------------
+        treatment_prompt_text = (
+f"A patient is diagnosed with '{diagnosis}' based on chest X-ray findings, "
+            f"with supporting radiographic evidence indicating: '{reasoning}'.\n"
+            f"Please provide clinical recommendations strictly using the following format:\n\n"
+            f"[Medications]\n(Provide recommended medications, drug classes, or first-line choices here)\n\n"
+            f"[Treatment]\n(Provide general treatment, supportive care, and clinical management plans here)\n\n"
+            f"Keep the output concise, structured, and professionally written."
+        )
+        
+        m3_messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": treatment_prompt_text}
+            ]
+        }]
+        m3_prompt = processor_m1.apply_chat_template(m3_messages, tokenize=False, add_generation_prompt=True)
+        m3_inputs = processor_m1(text=[m3_prompt], return_tensors="pt").to(device_m1)
+
+        with torch.no_grad():
+            m3_outputs = model_m1.generate(
+                **m3_inputs,
+                max_new_tokens=350, 
+                pad_token_id=processor_m1.tokenizer.pad_token_id or processor_m1.tokenizer.eos_token_id
+            )
+        m3_input_len = m3_inputs["input_ids"].shape[-1]
+        tx_raw = processor_m1.decode(m3_outputs[0][m3_input_len:], skip_special_tokens=True).strip()
+        
+        # 🧠 解析文字，將 Medications 與 Treatment 分流
+        medications = "N/A"
+        treatment = "N/A"
+        
+        try:
+            if "[Medications]" in tx_raw and "[Treatment]" in tx_raw:
+                parts = tx_raw.split("[Treatment]")
+                treatment = parts[1].strip()
+                med_part = parts[0].replace("[Medications]", "").strip()
+                medications = med_part
+            else:
+                # 備用切分防呆機制
+                medications = tx_raw
+        except Exception as parse_err:
+            print(f"文字切分失敗，採用防呆輸出: {parse_err}")
+            medications = tx_raw
+
+        return diagnosis, reasoning, medications, treatment
 
     except Exception as e:
-        print(f"雙模型推理過程中發生錯誤: {e}")
-        return "Analysis Failed (AI Error)", "N/A"
+        print(f"多階段模型推理過程中發生錯誤: {e}")
+        return "Analysis Failed (AI Error)", "N/A", "N/A", "N/A"
 
 
 import uuid
@@ -193,8 +238,8 @@ from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
-def create_and_upload_encapsulated_pdf(instance_id, diagnosis, reasoning):
-    """將模型一與模型二的預測與推導原因美化排版至 PDF 並上傳"""
+def create_and_upload_encapsulated_pdf(instance_id, diagnosis, reasoning, medications, treatment):
+    """將四大核心維度（Diagnosis, Reasoning, Medications, Treatment）精準排版至 PDF 並上傳"""
     try:
         tags_url = f"{ORTHANC_URL}/instances/{instance_id}/tags"
         tags_res = requests.get(tags_url, auth=AUTH, timeout=5)
@@ -220,24 +265,36 @@ def create_and_upload_encapsulated_pdf(instance_id, diagnosis, reasoning):
         
         styles = getSampleStyleSheet()
         title_style = ParagraphStyle('TitleStyle', parent=styles['Heading1'], fontSize=18, leading=22, spaceAfter=15, textColor='#1A365D')
-        section_style = ParagraphStyle('SecStyle', parent=styles['Heading2'], fontSize=12, leading=16, spaceBefore=10, spaceAfter=5, textColor='#2C5282')
+        section_style = ParagraphStyle('SecStyle', parent=styles['Heading2'], fontSize=12, leading=16, spaceBefore=12, spaceAfter=5, textColor='#2C5282')
         body_style = ParagraphStyle('BodyStyle', parent=styles['Normal'], fontSize=11, leading=16, spaceAfter=10)
         
         story = []
-        story.append(Paragraph("<b>MedGemma Dual-Stage AI Clinical Report</b>", title_style))
+        story.append(Paragraph("<b>MedGemma Multi-Stage AI Clinical Report</b>", title_style))
         story.append(Paragraph(f"<b>Patient ID:</b> {patient_id} &nbsp;&nbsp;&nbsp;&nbsp; <b>Name:</b> {patient_name}", body_style))
         story.append(Paragraph(f"<b>Generated Time:</b> {time.strftime('%Y-%m-%d %H:%M:%S')}", body_style))
         story.append(Spacer(1, 15))
         
-        # 寫入模型一：疾病分類
-        story.append(Paragraph("<b>[1. AI Predicted Diagnosis]</b>", section_style))
+        # 1. Diagnosis
+        story.append(Paragraph("<b>[1. Diagnosis]</b>", section_style))
         story.append(Paragraph(f"<font color='#C53030'><b>{diagnosis}</b></font>", body_style))
-        story.append(Spacer(1, 10))
+        story.append(Spacer(1, 3))
         
-        # 寫入模型二：27B 推理原因
-        story.append(Paragraph("<b>[2. Radiographic Pathological Reasoning]</b>", section_style))
+        # 2. Reasoning
+        story.append(Paragraph("<b>[2. Reasoning]</b>", section_style))
         formatted_reasoning = reasoning.replace('\n', '<br/>')
         story.append(Paragraph(formatted_reasoning, body_style))
+        story.append(Spacer(1, 3))
+        
+        # 3. Medications
+        story.append(Paragraph("<b>[3. Medications]</b>", section_style))
+        formatted_meds = medications.replace('\n', '<br/>')
+        story.append(Paragraph(formatted_meds, body_style))
+        story.append(Spacer(1, 3))
+
+        # 4. Treatment
+        story.append(Paragraph("<b>[4. Treatment]</b>", section_style))
+        formatted_tx = treatment.replace('\n', '<br/>')
+        story.append(Paragraph(formatted_tx, body_style))
         
         doc.build(story)
         pdf_data = pdf_buffer.getvalue()
@@ -280,7 +337,7 @@ def create_and_upload_encapsulated_pdf(instance_id, diagnosis, reasoning):
         ds.InstanceNumber = "1"
         
         ds.InstanceMIMETypeInEncapsulatedDocument = "application/pdf"
-        ds.DocumentTitle = f"MedGemma AI Report ({diagnosis})"
+        ds.DocumentTitle = f"MedGemma Full AI Report ({diagnosis})"
         ds.EncapsulatedDocument = pdf_data
 
         fp = BytesIO()
@@ -332,11 +389,9 @@ def process_webhook_task(sop_id):
             return
 
         # 🧠 呼叫優化後的雙階段 AI 模型
-        diagnosis, reasoning = analyze_image_with_dual_ai(instance_uuid)
+        diagnosis, reasoning, medications, treatment = analyze_image_with_dual_ai(instance_uuid)
+        new_instance_id = create_and_upload_encapsulated_pdf(instance_uuid, diagnosis, reasoning, medications, treatment)
 
-        # 💾 封裝兩階段結果至 PDF
-        new_instance_id = create_and_upload_encapsulated_pdf(instance_uuid, diagnosis, reasoning)
- 
         if new_instance_id:
             print(f"✅ [管線完成] 新結構化 PDF 報告上傳成功！內部 ID: {new_instance_id}")
             with counter_lock:
