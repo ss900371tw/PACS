@@ -5,7 +5,5 @@ services:
     ports:
       - "8042:8042"
     volumes:
-      - ./PACS.jpg:/etc/orthanc/custom-logo.jpg
-      - ./pacs-trigger.lua:/etc/orthanc/pacs-trigger.lua
       - ./orthanc.json:/etc/orthanc/orthanc.json
 
